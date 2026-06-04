@@ -1,0 +1,128 @@
+name: Fetch 25Live Events
+
+on:
+  schedule:
+    # Runs every 2 hours
+    - cron: '0 */2 * * *'
+  workflow_dispatch: # allows manual trigger from GitHub UI
+
+jobs:
+  fetch-events:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Fetch events from 25Live API
+        env:
+          R25_USERNAME: ${{ secrets.R25_USERNAME }}
+          R25_PASSWORD: ${{ secrets.R25_PASSWORD }}
+        run: |
+          python3 - <<'EOF'
+          import urllib.request
+          import urllib.parse
+          import base64
+          import xml.etree.ElementTree as ET
+          import json
+          import os
+          from datetime import datetime, timedelta
+
+          USERNAME = os.environ["R25_USERNAME"]
+          PASSWORD = os.environ["R25_PASSWORD"]
+
+          BASE_URL = "https://webservices.collegenet.com/r25ws/wrd/calstatela/run"
+          NS = "http://www.collegenet.com/r25"
+
+          # Auth header
+          credentials = base64.b64encode(f"{USERNAME}:{PASSWORD}".encode()).decode()
+          headers = {
+              "Authorization": f"Basic {credentials}",
+              "Accept": "application/xml"
+          }
+
+          # Date range: today through 6 months out
+          today = datetime.now()
+          end = today + timedelta(days=180)
+          start_dt = today.strftime("%Y-%m-%d")
+          end_dt = end.strftime("%Y-%m-%d")
+
+          # Internal cabinets (Academics = id 4)
+          # External/Campus Events cabinet (Campus Events = id 5)
+          # We fetch all confirmed events across both cabinets
+
+          def fetch_xml(url):
+              req = urllib.request.Request(url, headers=headers)
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  return ET.fromstring(resp.read())
+
+          def parse_events(root, audience):
+              events = []
+              for ev in root.findall(f"{{{NS}}}event"):
+                  node_type = ev.findtext(f"{{{NS}}}node_type", "")
+                  if node_type != "E":  # skip cabinets/folders
+                      continue
+
+                  state = ev.findtext(f"{{{NS}}}state_name", "")
+                  if state not in ("Confirmed", "Tentative"):
+                      continue
+
+                  org_el = ev.find(f"{{{NS}}}organization")
+                  org_name = ""
+                  if org_el is not None:
+                      org_name = org_el.findtext(f"{{{NS}}}organization_name", "")
+
+                  events.append({
+                      "id": ev.findtext(f"{{{NS}}}event_id", ""),
+                      "title": ev.findtext(f"{{{NS}}}event_name", "Untitled Event"),
+                      "start": ev.findtext(f"{{{NS}}}start_date", ""),
+                      "end": ev.findtext(f"{{{NS}}}end_date", ""),
+                      "type": ev.findtext(f"{{{NS}}}event_type_name", ""),
+                      "state": state,
+                      "cabinet": ev.findtext(f"{{{NS}}}cabinet_name", ""),
+                      "organization": org_name,
+                      "locator": ev.findtext(f"{{{NS}}}event_locator", ""),
+                      "audience": audience,
+                  })
+              return events
+
+          all_events = []
+
+          # Fetch Campus Events (external/public)
+          try:
+              url = f"{BASE_URL}/events.xml?cabinet_id=5&start_dt={start_dt}&end_dt={end_dt}"
+              root = fetch_xml(url)
+              all_events += parse_events(root, "external")
+              print(f"Campus Events fetched: {len(all_events)}")
+          except Exception as e:
+              print(f"Error fetching campus events: {e}")
+
+          # Fetch Academics (internal)
+          try:
+              url = f"{BASE_URL}/events.xml?cabinet_id=4&start_dt={start_dt}&end_dt={end_dt}"
+              root = fetch_xml(url)
+              academic_events = parse_events(root, "internal")
+              all_events += academic_events
+              print(f"Academic Events fetched: {len(academic_events)}")
+          except Exception as e:
+              print(f"Error fetching academic events: {e}")
+
+          output = {
+              "last_updated": datetime.now().isoformat(),
+              "event_count": len(all_events),
+              "events": all_events
+          }
+
+          with open("docs/events.json", "w") as f:
+              json.dump(output, f, indent=2)
+
+          print(f"Total events written: {len(all_events)}")
+          EOF
+
+      - name: Commit updated events.json
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/events.json
+          git diff --staged --quiet || git commit -m "chore: update events.json [$(date -u '+%Y-%m-%d %H:%M')] UTC"
+          git push
